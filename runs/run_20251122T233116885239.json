@@ -1,0 +1,17 @@
+{
+  "script": "examples/train_pytorch_example.py",
+  "checkpoint_dir": "/tmp/ai_orchestrator_pytorch",
+  "success": true,
+  "attempts": 1,
+  "timestamp_utc": "2025-11-22T23:31:16.885239",
+  "backend": "local",
+  "python_executable": "/Users/astrodingra/Documents/orchestrator-core/venv/bin/python3",
+  "extra_args": [],
+  "max_retries": 3,
+  "slurm": {
+    "partition": null,
+    "gpus": 1,
+    "time": "01:00:00",
+    "job_name": "orc_job"
+  }
+}

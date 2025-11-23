@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fluxaa"
+version = "0.0.1"
+description = "Minimal ML job orchestrator with auto-resume and history."
+authors = [
+  { name = "Jashanpreet Singh", email = "astrodingra@gmail.com" }
+]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "click>=8.0.0",
+]
+
+[project.scripts]
+orc = "orchestrator.cli:cli"
+
+[tool.setuptools]
+packages = ["orchestrator"]

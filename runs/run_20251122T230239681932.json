@@ -1,0 +1,7 @@
+{
+  "script": "examples/train_example.py",
+  "checkpoint_dir": "/tmp/ai_orchestrator_test",
+  "success": true,
+  "attempts": 1,
+  "timestamp_utc": "2025-11-22T23:02:39.681932"
+}
