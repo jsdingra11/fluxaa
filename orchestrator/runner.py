@@ -1,325 +1,233 @@
-# orchestrator/runner.py
+from __future__ import annotations
 
+import json
 import subprocess
 import sys
-import time
-import json
+import uuid
+from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+RUNS_DIR = Path("runs")
+RUNS_DIR.mkdir(exist_ok=True)
 
 
-class JobConfig:
-    def __init__(
-        self,
-        script_path: str,
-        checkpoint_dir: str,
-        max_retries: int = 3,
-        python_executable: str = sys.executable,
-        extra_args: Optional[List[str]] = None,
-        backend: str = "local",
-        slurm_partition: Optional[str] = None,
-        slurm_gpus: int = 1,
-        slurm_time: str = "01:00:00",
-        slurm_job_name: str = "orc_job",
-        run_name: Optional[str] = None,
-    ):
-        self.script_path = script_path
-        self.checkpoint_dir = checkpoint_dir
-        self.max_retries = max_retries
-        self.python_executable = python_executable
-        self.extra_args = extra_args or []
-
-        # backend can be "local" or "slurm"
-        self.backend = backend
-
-        # Slurm-specific options (used only if backend == "slurm")
-        self.slurm_partition = slurm_partition
-        self.slurm_gpus = slurm_gpus
-        self.slurm_time = slurm_time
-        self.slurm_job_name = slurm_job_name
-
-        # Optional human-friendly name for this run
-        self.run_name = run_name
+def _now_utc_iso() -> str:
+    return datetime.utcnow().isoformat()
 
 
-def _log_run(
-    config: JobConfig,
-    success: bool,
-    attempts: int,
-    start_time_utc: str,
-    end_time_utc: str,
-    last_exit_code: int,
-):
-    """Log a summary of the run (including config) to runs/run_<id>.json."""
-    runs_dir = Path("runs")
-    runs_dir.mkdir(exist_ok=True)
-
-    run_id = start_time_utc.replace(":", "").replace("-", "").replace(".", "")
-    log_path = runs_dir / f"run_{run_id}.json"
-
-    # duration in seconds
-    try:
-        t0 = datetime.fromisoformat(start_time_utc)
-        t1 = datetime.fromisoformat(end_time_utc)
-        duration_seconds = (t1 - t0).total_seconds()
-    except Exception:
-        duration_seconds = None
-
-    data = {
-        "run_id": run_id,
-        "name": config.run_name,
-        "script": str(config.script_path),
-        "checkpoint_dir": str(config.checkpoint_dir),
-        "success": success,
-        "attempts": attempts,
-        "timestamp_start_utc": start_time_utc,
-        "timestamp_end_utc": end_time_utc,
-        "duration_seconds": duration_seconds,
-        "backend": config.backend,
-        "python_executable": config.python_executable,
-        "extra_args": config.extra_args,
-        "max_retries": config.max_retries,
-        "last_exit_code": last_exit_code,
-        "slurm": {
-            "partition": config.slurm_partition,
-            "gpus": config.slurm_gpus,
-            "time": config.slurm_time,
-            "job_name": config.slurm_job_name,
-        },
-    }
-
-    with log_path.open("w") as f:
-        json.dump(data, f, indent=2)
-
-    print(f"[orchestrator] Logged run -> {log_path}")
+def _generate_run_id() -> str:
+    # e.g. 20251123T105121470510
+    return datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
 
 
-def run_ml_job(config: JobConfig) -> bool:
+@dataclass
+class RunRecord:
+    run_id: str
+    name: str
+    script: str
+    backend: str
+    status: str
+    attempts: int
+    last_exit_code: Optional[int]
+    checkpoint_dir: str
+    start_time: Optional[str]
+    end_time: Optional[str]
+    duration_s: Optional[float]
+    extra_args: List[str]
+    metrics: Optional[Dict[str, Any]] = None
+
+    @property
+    def log_path(self) -> Path:
+        return RUNS_DIR / f"run_{self.run_id}.json"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RunRecord":
+        # Backwards compatibility if metrics missing
+        if "metrics" not in data:
+            data["metrics"] = None
+        return cls(**data)
+
+
+def _save_run_record(record: RunRecord) -> None:
+    record.log_path.parent.mkdir(exist_ok=True)
+    with record.log_path.open("w") as f:
+        json.dump(record.to_dict(), f, indent=2)
+
+
+def _parse_fluxaa_metrics(output: str) -> Optional[Dict[str, Any]]:
     """
-    Dispatch to the correct backend implementation.
+    Scan combined stdout/stderr for a JSON line like:
+        {"fluxaa_metrics": {...}}
+    and return the inner dict.
     """
-    if config.backend == "local":
-        return _run_local(config)
-    elif config.backend == "slurm":
-        return _run_slurm(config)
-    else:
-        raise ValueError(f"Unsupported backend: {config.backend}")
+    # Look from bottom up (most likely near the end)
+    for line in reversed(output.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        if "fluxaa_metrics" not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "fluxaa_metrics" in obj:
+            metrics = obj["fluxaa_metrics"]
+            if isinstance(metrics, dict):
+                return metrics
+    return None
 
 
-def _run_local(config: JobConfig) -> bool:
+def _run_subprocess_with_output(cmd: List[str]) -> Tuple[int, str]:
     """
-    Local execution using subprocess.
+    Run a subprocess, stream output to our stdout, and capture it.
+    Returns (returncode, combined_output).
     """
-    script = Path(config.script_path)
-    if not script.exists():
-        raise FileNotFoundError(f"Script not found: {script}")
+    print(f"[orchestrator][local] Running: {' '.join(cmd)}")
+    sys.stdout.flush()
 
-    checkpoint_dir = Path(config.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    lines: List[str] = []
 
-    start_dt = datetime.utcnow().isoformat()
-    last_exit_code = -1
-    attempt = 0
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        lines.append(line)
+        # Stream to user in real-time
+        print(line, end="")
+    proc.wait()
 
-    while attempt <= config.max_retries:
-        print(f"\n[orchestrator][local] Attempt {attempt + 1}/{config.max_retries + 1}")
+    return proc.returncode, "".join(lines)
 
-        cmd = [
-            config.python_executable,
-            str(script),
-            "--checkpoint-dir",
-            str(checkpoint_dir),
-        ]
 
-        # On retry, tell the script to resume from checkpoint
-        if attempt > 0:
+def run_local_job(
+    script: str,
+    checkpoint_dir: str,
+    max_retries: int,
+    extra_args: Optional[List[str]] = None,
+    name: str = "",
+    python_executable: str = sys.executable,
+) -> RunRecord:
+    """
+    Core orchestration loop for the 'local' backend.
+
+    - Retries up to max_retries on non-zero exit code.
+    - Always logs a RunRecord to runs/run_<id>.json
+    - On SUCCESS, attempts to parse fluxaa_metrics from child output.
+    """
+    extra_args = extra_args or []
+    run_id = _generate_run_id()
+    attempts_allowed = max_retries + 1
+
+    record = RunRecord(
+        run_id=run_id,
+        name=name,
+        script=script,
+        backend="local",
+        status="RUNNING",
+        attempts=0,
+        last_exit_code=None,
+        checkpoint_dir=checkpoint_dir,
+        start_time=_now_utc_iso(),
+        end_time=None,
+        duration_s=None,
+        extra_args=extra_args,
+        metrics=None,
+    )
+
+    RUNS_DIR.mkdir(exist_ok=True)
+
+    script_path = Path(script)
+    if not script_path.exists():
+        print(f"[orchestrator][local] ERROR: script not found: {script}", file=sys.stderr)
+        record.status = "FAIL"
+        record.end_time = _now_utc_iso()
+        _save_run_record(record)
+        return record
+
+    cmd_base = [python_executable, str(script_path), "--checkpoint-dir", checkpoint_dir]
+
+    last_output: str = ""
+
+    print()
+    for attempt in range(1, attempts_allowed + 1):
+        print(f"[orchestrator][local] Attempt {attempt}/{attempts_allowed}")
+        sys.stdout.flush()
+
+        cmd = cmd_base.copy()
+        if attempt > 1:
+            # On retries, inject --resume
             cmd.append("--resume")
 
-        # Add any extra user arguments
-        cmd.extend(config.extra_args)
+        # Add user extra args at the end
+        cmd.extend(extra_args)
 
-        print(f"[orchestrator][local] Running: {' '.join(cmd)}")
+        code, combined_output = _run_subprocess_with_output(cmd)
+        last_output = combined_output
+        record.attempts = attempt
+        record.last_exit_code = code
 
-        proc = subprocess.Popen(cmd)
-        last_exit_code = proc.wait()
-
-        if last_exit_code == 0:
+        if code == 0:
             print("[orchestrator][local] Job completed successfully ✅")
-            end_dt = datetime.utcnow().isoformat()
-            _log_run(
-                config,
-                success=True,
-                attempts=attempt + 1,
-                start_time_utc=start_dt,
-                end_time_utc=end_dt,
-                last_exit_code=last_exit_code,
-            )
-            return True
-
-        print(f"[orchestrator][local] Job failed with exit code {last_exit_code} ❌")
-        attempt += 1
-
-        if attempt > config.max_retries:
-            print("[orchestrator][local] Reached max retries. Giving up.")
+            record.status = "SUCCESS"
             break
+        else:
+            print(f"[orchestrator][local] Job failed with exit code {code} ❌")
+            if attempt >= attempts_allowed:
+                print("[orchestrator][local] Reached max retries. Giving up.")
+                record.status = "FAIL"
+                break
+            else:
+                print("[orchestrator][local] Retrying...")
 
-        time.sleep(5)
+    record.end_time = _now_utc_iso()
+    try:
+        start_dt = datetime.fromisoformat(record.start_time)
+        end_dt = datetime.fromisoformat(record.end_time)
+        record.duration_s = (end_dt - start_dt).total_seconds()
+    except Exception:
+        record.duration_s = None
 
-    end_dt = datetime.utcnow().isoformat()
-    _log_run(
-        config,
-        success=False,
-        attempts=attempt,
-        start_time_utc=start_dt,
-        end_time_utc=end_dt,
-        last_exit_code=last_exit_code,
-    )
-    return False
+    # If success, try to parse metrics from output
+    if record.status == "SUCCESS":
+        metrics = _parse_fluxaa_metrics(last_output)
+        if metrics is not None:
+            record.metrics = metrics
+            print(f"[orchestrator][local] Parsed metrics from child process: {metrics}")
+
+    _save_run_record(record)
+    print(f"[orchestrator] Logged run -> {record.log_path.name}")
+    return record
 
 
-# Slurm helpers unchanged; they still call _log_run at the end.
+def load_all_runs() -> List[RunRecord]:
+    records: List[RunRecord] = []
+    if not RUNS_DIR.exists():
+        return records
+    for path in sorted(RUNS_DIR.glob("run_*.json")):
+        try:
+            with path.open("r") as f:
+                data = json.load(f)
+            records.append(RunRecord.from_dict(data))
+        except Exception:
+            continue
+    # Sort by run_id (roughly chronological)
+    records.sort(key=lambda r: r.run_id)
+    return records
 
-def _submit_slurm_job(job_script: Path) -> Optional[str]:
-    """
-    Submit a Slurm job script via sbatch and return the job id as string.
-    """
-    print(f"[orchestrator][slurm] Submitting job script: {job_script}")
-    proc = subprocess.run(["sbatch", str(job_script)], capture_output=True, text=True)
-    if proc.returncode != 0:
-        print("[orchestrator][slurm] sbatch failed:")
-        print(proc.stderr)
+
+def get_run_by_index(idx: int) -> Optional[RunRecord]:
+    runs = load_all_runs()
+    if idx < 1 or idx > len(runs):
         return None
-
-    stdout = proc.stdout.strip()
-    print(f"[orchestrator][slurm] sbatch output: {stdout}")
-    parts = stdout.split()
-    job_id = parts[-1] if parts else None
-    return job_id
-
-
-def _wait_for_slurm_job(job_id: str) -> bool:
-    """
-    Poll Slurm until job finishes. Returns True if COMPLETED, False otherwise.
-    Uses 'sacct'; may need adaption per cluster.
-    """
-    print(f"[orchestrator][slurm] Waiting for job {job_id} to finish ...")
-
-    while True:
-        proc = subprocess.run(
-            ["sacct", "-j", job_id, "--format=State", "-P"],
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode != 0:
-            print("[orchestrator][slurm] sacct not ready or job not yet visible, retrying ...")
-            time.sleep(10)
-            continue
-
-        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-        if len(lines) < 2:
-            time.sleep(10)
-            continue
-
-        state_line = lines[1]
-        state = state_line.split("|")[0]
-        print(f"[orchestrator][slurm] Job {job_id} state: {state}")
-
-        if state in ("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"):
-            return state == "COMPLETED"
-
-        time.sleep(10)
-
-
-def _run_slurm(config: JobConfig) -> bool:
-    """
-    Slurm-backed execution.
-    Not testable on your Mac, but ready for a real cluster.
-    """
-    script = Path(config.script_path)
-    if not script.exists():
-        raise FileNotFoundError(f"Script not found: {script}")
-
-    checkpoint_dir = Path(config.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    runs_dir = Path("slurm_jobs")
-    runs_dir.mkdir(exist_ok=True)
-
-    start_dt = datetime.utcnow().isoformat()
-    last_exit_code = -1
-    attempt = 0
-
-    while attempt <= config.max_retries:
-        print(f"\n[orchestrator][slurm] Attempt {attempt + 1}/{config.max_retries + 1}")
-
-        py_cmd_parts = [
-            config.python_executable,
-            str(script),
-            "--checkpoint-dir",
-            str(checkpoint_dir),
-        ]
-        if attempt > 0:
-            py_cmd_parts.append("--resume")
-        py_cmd_parts.extend(config.extra_args)
-        py_cmd = " ".join(py_cmd_parts)
-
-        ts = datetime.utcnow().isoformat().replace(":", "").replace("-", "").replace(".", "")
-        job_script = runs_dir / f"job_{config.slurm_job_name}_{ts}_attempt{attempt+1}.sh"
-
-        lines = [
-            "#!/bin/bash",
-            f"#SBATCH --job-name={config.slurm_job_name}",
-            f"#SBATCH --time={config.slurm_time}",
-            f"#SBATCH --gres=gpu:{config.slurm_gpus}",
-            "#SBATCH --output=slurm-%j.out",
-        ]
-        if config.slurm_partition:
-            lines.append(f"#SBATCH --partition={config.slurm_partition}")
-
-        lines.append("")
-        lines.append(f"echo 'Running command: {py_cmd}'")
-        lines.append(py_cmd)
-
-        job_script.write_text("\n".join(lines))
-        print(f"[orchestrator][slurm] Wrote job script: {job_script}")
-
-        job_id = _submit_slurm_job(job_script)
-        if job_id is None:
-            print("[orchestrator][slurm] Failed to submit job.")
-            attempt += 1
-            time.sleep(5)
-            continue
-
-        success = _wait_for_slurm_job(job_id)
-        last_exit_code = 0 if success else 1
-        if success:
-            print("[orchestrator][slurm] Job completed successfully ✅")
-            end_dt = datetime.utcnow().isoformat()
-            _log_run(
-                config,
-                success=True,
-                attempts=attempt + 1,
-                start_time_utc=start_dt,
-                end_time_utc=end_dt,
-                last_exit_code=last_exit_code,
-            )
-            return True
-
-        print("[orchestrator][slurm] Job failed according to Slurm state ❌")
-        attempt += 1
-        if attempt > config.max_retries:
-            print("[orchestrator][slurm] Reached max retries. Giving up.")
-            break
-        time.sleep(5)
-
-    end_dt = datetime.utcnow().isoformat()
-    _log_run(
-        config,
-        success=False,
-        attempts=attempt,
-        start_time_utc=start_dt,
-        end_time_utc=end_dt,
-        last_exit_code=last_exit_code,
-    )
-    return False
+    return runs[idx - 1]

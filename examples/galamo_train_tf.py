@@ -20,7 +20,9 @@ def parse_args():
     p.add_argument("--resume", action="store_true", help="Resume from checkpoint if available")
     p.add_argument("--epochs", type=int, default=25, help="Total number of epochs to train")
     p.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    p.add_argument("--max-samples", type=int, default=2000, help="Limit number of samples for memory")
     return p.parse_args()
+
 
 def load_data(h5_file_path: str, max_samples: int = 2000):
     print(f"[galamo_tf] Loading data from {h5_file_path}")
@@ -44,6 +46,7 @@ def load_data(h5_file_path: str, max_samples: int = 2000):
 
     print(f"[galamo_tf] X_train: {X_train.shape}, X_test: {X_test.shape}")
     return X_train, X_test, y_train, y_test, num_classes
+
 
 def build_model(num_classes: int):
     print(f"[galamo_tf] Building model with {num_classes} classes")
@@ -120,11 +123,13 @@ def main():
     args = parse_args()
     checkpoint_dir = Path(args.checkpoint_dir)
 
-    X_train, X_test, y_train, y_test, num_classes = load_data(args.h5_file, max_samples=2000)
-
+    X_train, X_test, y_train, y_test, num_classes = load_data(
+        args.h5_file, max_samples=args.max_samples
+    )
 
     # Save "encoder" equivalent (num_classes) just like your notebook
     encoder_path = checkpoint_dir / "encoder.pkl"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     with encoder_path.open("wb") as f:
         pickle.dump(num_classes, f)
     print(f"[galamo_tf] Saved encoder info -> {encoder_path}")
@@ -144,6 +149,8 @@ def main():
     total_epochs = args.epochs
     print(f"[galamo_tf] Training from epoch {start_epoch+1} to {total_epochs}")
 
+    best_val_acc = None
+
     for epoch in range(start_epoch, total_epochs):
         print(f"[galamo_tf] Epoch {epoch + 1}/{total_epochs}")
 
@@ -158,6 +165,9 @@ def main():
         val_acc = history.history.get("val_accuracy", [None])[-1]
         print(f"[galamo_tf] Epoch {epoch+1} done. Train acc={train_acc}, Val acc={val_acc}")
 
+        if best_val_acc is None or (val_acc is not None and val_acc > best_val_acc):
+            best_val_acc = val_acc
+
         save_checkpoint(checkpoint_dir, epoch + 1, model)
 
     # Final test evaluation
@@ -168,6 +178,15 @@ def main():
     final_model_path = checkpoint_dir / "final_model.keras"
     model.save(final_model_path)
     print(f"[galamo_tf] Saved final model -> {final_model_path}")
+
+    # 🔴 Emit metrics in a machine-readable way for the orchestrator
+    metrics = {
+        "final_test_accuracy": float(acc),
+        "best_val_accuracy": float(best_val_acc) if best_val_acc is not None else None,
+        "epochs": int(args.epochs),
+        "num_samples": int(X_train.shape[0] + X_test.shape[0]),
+    }
+    print(json.dumps({"fluxaa_metrics": metrics}))
 
     print("[galamo_tf] Training completed successfully.")
 
