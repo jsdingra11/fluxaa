@@ -25,3 +25,4 @@ runs/
 .vscode/
 .idea/
 .DS_Store
+examples/data_galamo/
