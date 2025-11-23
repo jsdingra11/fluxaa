@@ -5,14 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fluxaa"
 version = "0.0.1"
-description = "Minimal ML job orchestrator with auto-resume and history."
+description = "Minimal ML job orchestrator with auto-resume, history, rerun, and status."
 authors = [
-  { name = "Jashanpreet Singh", email = "astrodingra@gmail.com" }
+  { name = "Jashanpreet Singh" }
 ]
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
   "click>=8.0.0",
+  "pyyaml>=6.0",
 ]
 
 [project.scripts]

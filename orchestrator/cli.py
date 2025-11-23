@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional, List
 
 import click
+import yaml
 
 from .runner import JobConfig, run_ml_job
 
@@ -15,6 +16,10 @@ def cli():
     """Simple ML job orchestrator."""
     pass
 
+
+# =========================
+# run (CLI-driven)
+# =========================
 
 @cli.command()
 @click.argument("script_path", type=click.Path(exists=True))
@@ -128,6 +133,10 @@ def run(
     sys.exit(0 if success else 1)
 
 
+# =========================
+# list-runs
+# =========================
+
 @cli.command("list-runs")
 def list_runs():
     """
@@ -166,15 +175,21 @@ def list_runs():
         )
 
     click.echo(
-        f"{'IDX':>3}  {'STATUS':>7}  {'ATT':>3}  {'BACKEND':>7}  {'NAME':<18}  {'SCRIPT':<28}  {'RUN_ID'}"
+        f"{'IDX':>3}  {'STATUS':>7}  {'ATT':>3}  {'BACKEND':>7}  "
+        f"{'NAME':<18}  {'SCRIPT':<28}  {'RUN_ID'}"
     )
     click.echo("-" * 110)
     for r in rows:
         status = "OK" if r["success"] else "FAIL"
         click.echo(
-            f"{r['idx']:>3}  {status:>7}  {r['attempts']:>3}  {r['backend']:>7}  {r['name'][:18]:<18}  {r['script']:<28}  {r['run_id']}"
+            f"{r['idx']:>3}  {status:>7}  {r['attempts']:>3}  {r['backend']:>7}  "
+            f"{r['name'][:18]:<18}  {r['script']:<28}  {r['run_id']}"
         )
 
+
+# =========================
+# status
+# =========================
 
 @cli.command("status")
 @click.argument("run_idx", type=int)
@@ -225,6 +240,10 @@ def status(run_idx: int):
     click.echo(f"Extra args:     {extra_args}")
 
 
+# =========================
+# rerun
+# =========================
+
 @cli.command("rerun")
 @click.argument("run_idx", type=int)
 @click.option(
@@ -248,7 +267,12 @@ def status(run_idx: int):
     default=None,
     help="Override extra args (space-separated) for this rerun.",
 )
-def rerun(run_idx: int, max_retries: Optional[int], backend: Optional[str], extra_args: Optional[str]):
+def rerun(
+    run_idx: int,
+    max_retries: Optional[int],
+    backend: Optional[str],
+    extra_args: Optional[str],
+):
     """
     Rerun a past job by its index from list-runs.
     """
@@ -312,6 +336,74 @@ def rerun(run_idx: int, max_retries: Optional[int], backend: Optional[str], extr
         slurm_job_name=stored_job_name,
         run_name=data.get("name"),
     )
+
+    success = run_ml_job(config)
+    sys.exit(0 if success else 1)
+
+
+# =========================
+# run-config (YAML)
+# =========================
+
+@cli.command("run-config")
+@click.argument("config_file", type=click.Path(exists=True))
+def run_config(config_file: str):
+    """
+    Run a job defined in a YAML config file.
+
+    Example YAML:
+
+    name: resnet_test
+    script: examples/train_pytorch_example.py
+    checkpoint_dir: /tmp/resnet_ckpts
+    backend: local
+    python_executable: python3
+    max_retries: 2
+    extra_args:
+      - --epochs
+      - "5"
+      - --lr
+      - "0.001"
+    """
+    path = Path(config_file)
+    with path.open("r") as f:
+        cfg = yaml.safe_load(f)
+
+    # Required fields
+    script = cfg["script"]
+    checkpoint_dir = cfg["checkpoint_dir"]
+
+    name = cfg.get("name")
+    backend = cfg.get("backend", "local")
+    python_executable = cfg.get("python_executable", sys.executable)
+    max_retries = cfg.get("max_retries", 3)
+    extra_args = cfg.get("extra_args", []) or []
+
+    slurm_partition = cfg.get("slurm_partition")
+    slurm_gpus = cfg.get("slurm_gpus", 1)
+    slurm_time = cfg.get("slurm_time", "01:00:00")
+    slurm_job_name = cfg.get("slurm_job_name", name or "orc_job")
+
+    config = JobConfig(
+        script_path=script,
+        checkpoint_dir=checkpoint_dir,
+        max_retries=max_retries,
+        python_executable=python_executable,
+        extra_args=extra_args,
+        backend=backend,
+        slurm_partition=slurm_partition,
+        slurm_gpus=slurm_gpus,
+        slurm_time=slurm_time,
+        slurm_job_name=slurm_job_name,
+        run_name=name,
+    )
+
+    click.echo(f"[orchestrator][run-config] Loaded config from {config_file}")
+    click.echo(f"[orchestrator][run-config] Name: {name}")
+    click.echo(f"[orchestrator][run-config] Script: {script}")
+    click.echo(f"[orchestrator][run-config] Backend: {backend}")
+    click.echo(f"[orchestrator][run-config] Checkpoint dir: {checkpoint_dir}")
+    click.echo(f"[orchestrator][run-config] Extra args: {extra_args}")
 
     success = run_ml_job(config)
     sys.exit(0 if success else 1)

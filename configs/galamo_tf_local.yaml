@@ -1,0 +1,13 @@
+name: galamo_tf_test
+script: examples/galamo_train_tf.py
+checkpoint_dir: /tmp/galamo_tf_ckpts
+backend: local
+python_executable: python3
+max_retries: 2
+extra_args:
+  - --h5-file
+  - examples/data_galamo/galaxy.h5
+  - --epochs
+  - "20"
+  - --batch-size
+  - "32"
