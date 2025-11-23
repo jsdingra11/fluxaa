@@ -10,3 +10,18 @@ runs/
 .tmp/
 .idea/
 .vscode/
+
+# Python junk
+__pycache__/
+*.egg-info/
+venv*/
+*.pyc
+
+# Orchestrator runtime
+runs/
+.tmp/
+
+# IDE crap
+.vscode/
+.idea/
+.DS_Store

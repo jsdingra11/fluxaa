@@ -1,8 +1,0 @@
-Metadata-Version: 2.4
-Name: fluxaa
-Version: 0.0.1
-Summary: Minimal ML job orchestrator with auto-resume and history.
-Author-email: Jashanpreet Singh <astrodingra@gmail.com>
-Requires-Python: >=3.9
-Description-Content-Type: text/markdown
-Requires-Dist: click>=8.0.0
